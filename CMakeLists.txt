@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ----------------------------
+# Python (ABI + install dirs)
+# ----------------------------
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+
+# ----------------------------
 # Core library (C++)
 # ----------------------------
 add_library(lsm_core
@@ -30,17 +35,60 @@ add_executable(test_smoke tests/cpp/test_smoke.cpp)
 target_link_libraries(test_smoke PRIVATE lsm_core)
 
 # ----------------------------
-# PYBIND11 MODULE (Python)
+# pybind11 (system or submodule)
 # ----------------------------
-# Expect pybind11 as a submodule in external/pybind11
-# (Later you can switch to find_package(pybind11) if desired.)
-add_subdirectory(external/pybind11)
+option(USE_SYSTEM_PYBIND11 "Use system pybind11 if found" OFF)
 
+if (USE_SYSTEM_PYBIND11)
+    find_package(pybind11 CONFIG REQUIRED)
+else()
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/pybind11/CMakeLists.txt")
+        message(FATAL_ERROR "pybind11 submodule not found. Run: git submodule update --init --recursive")
+    endif()
+    add_subdirectory(external/pybind11)
+endif()
+
+# ----------------------------
+# PYBIND11 MODULE
+# ----------------------------
 pybind11_add_module(lsm_cpp
     src/cpp/bindings/pybind_module.cpp
 )
-
 target_link_libraries(lsm_cpp PRIVATE lsm_core)
-
-# Ensure the module can include project headers with the same include path as lsm_core
 target_include_directories(lsm_cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Visibility + nicer shared lib behavior
+set_target_properties(lsm_cpp PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+
+# RPATH: make editable/dev installs more robust
+if(APPLE)
+    set_target_properties(lsm_cpp PROPERTIES
+        INSTALL_RPATH "@loader_path"
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+    )
+elseif(UNIX)
+    set_target_properties(lsm_cpp PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+    )
+endif()
+
+# ----------------------------
+# Install target (puts extension under lsmhedge/)
+# ----------------------------
+if (DEFINED Python3_SITELIB)
+    set(PY_SITE_DIR "${Python3_SITELIB}")
+elseif(DEFINED Python3_SITEARCH)
+    set(PY_SITE_DIR "${Python3_SITEARCH}")
+else()
+    # fallback
+    set(PY_SITE_DIR "python")
+endif()
+
+install(TARGETS lsm_cpp
+    LIBRARY DESTINATION "${PY_SITE_DIR}/lsmhedge"
+    RUNTIME DESTINATION "${PY_SITE_DIR}/lsmhedge"
+)
