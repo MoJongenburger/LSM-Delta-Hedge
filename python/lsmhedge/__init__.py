@@ -75,3 +75,43 @@ def price_bermudan_put(
 
     res = lsm_cpp.price_bermudan_put_lsm(float(S0), float(K), float(r), float(q), float(sigma), float(T), cfg)
     return float(res.price), float(res.mc_stderr)
+from typing import Tuple
+
+def price_and_delta_bermudan_put(
+    S0: float,
+    K: float,
+    r: float,
+    q: float,
+    sigma: float,
+    T: float,
+    eps_rel: float = 1e-4,
+    **cfg_kwargs
+) -> Tuple[float, float, float, float]:
+    """
+    Returns: (price, delta, price_stderr, delta_stderr)
+
+    Delta is CRN finite-difference with *frozen LSM regression* (betas trained once at base S0).
+    """
+    _require_cpp()
+
+    if S0 <= 0 or K <= 0:
+        raise ValueError("S0 and K must be > 0")
+    if T <= 0:
+        raise ValueError("T must be > 0")
+    if sigma < 0:
+        raise ValueError("sigma must be >= 0")
+    if eps_rel <= 0:
+        raise ValueError("eps_rel must be > 0")
+
+    cfg = lsm_cpp.LSMConfig()
+    for k, v in cfg_kwargs.items():
+        if not hasattr(cfg, k):
+            raise TypeError(f"Unknown config key: {k}")
+        if k == "basis" and isinstance(v, str):
+            v = getattr(lsm_cpp.BasisType, v)
+        setattr(cfg, k, v)
+
+    res = lsm_cpp.price_and_delta_bermudan_put_lsm(float(S0), float(K), float(r), float(q),
+                                                   float(sigma), float(T), float(eps_rel), cfg)
+    return float(res.price), float(res.delta), float(res.price_stderr), float(res.delta_stderr)
+
