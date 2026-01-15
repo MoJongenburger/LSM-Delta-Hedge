@@ -1,5 +1,4 @@
 #include <pybind11/pybind11.h>
-
 #include "src/cpp/lsm/lsm_model.h"
 
 namespace py = pybind11;
@@ -30,12 +29,22 @@ PYBIND11_MODULE(lsm_cpp, m) {
     py::class_<lsm::LSMPriceResult>(m, "LSMPriceResult")
         .def(py::init<>())
         .def_readwrite("price", lsm::LSMPriceResult::price)
-        .def_readwrite("mc_stderr", lsm::LSMPriceResult::mc_stderr);
+        .def_readwrite("mc_stderr", lsm::LSMPriceResult::mc_stderr)
+        .def("__repr__", [](const lsm::LSMPriceResult& r) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "<LSMPriceResult price=%.10f stderr=%.3e>",
+                          r.price, r.mc_stderr);
+            return std::string(buf);
+        });
 
-    // ---- Functions ----
+    // ---- Functions (GIL released) ----
     m.def(
         "price_bermudan_put_lsm",
-        &lsm::price_bermudan_put_lsm,
+        [](double S0, double K, double r, double q, double sigma, double T, const lsm::LSMConfig& cfg) {
+            py::gil_scoped_release release;
+            return lsm::price_bermudan_put_lsm(S0, K, r, q, sigma, T, cfg);
+        },
         py::arg("S0"),
         py::arg("K"),
         py::arg("r"),
@@ -46,20 +55,11 @@ PYBIND11_MODULE(lsm_cpp, m) {
         R"pbdoc(
 Price a Bermudan PUT using Longstaff–Schwartz (LSM) under GBM in risk-neutral measure.
 
-Parameters
-----------
-S0 : float
-K  : float
-r  : float   (cont. comp risk-free rate)
-q  : float   (cont. comp dividend yield)
-sigma : float (annual volatility)
-T  : float   (years to maturity)
-cfg : LSMConfig
-
 Returns
 -------
-LSMPriceResult (price, mc_stderr)
+LSMPriceResult with fields:
+- price
+- mc_stderr
 )pbdoc"
     );
 }
-
