@@ -15,14 +15,20 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 add_library(lsm_core
     src/cpp/lsm/lsm_model.cpp
 )
+set_target_properties(lsm_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 target_include_directories(lsm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Eigen: prefer system Eigen3, fallback to external/eigen (submodule or vendored folder)
+# Eigen: prefer system Eigen3, fallback to external/eigen (vendored folder)
 find_package(Eigen3 QUIET)
 if (Eigen3_FOUND)
+    message(STATUS "Found Eigen3: using Eigen3::Eigen")
     target_link_libraries(lsm_core PUBLIC Eigen3::Eigen)
+    if (DEFINED EIGEN3_INCLUDE_DIR)
+        target_include_directories(lsm_core PUBLIC ${EIGEN3_INCLUDE_DIR})
+    endif()
 else()
     message(STATUS "Eigen3 not found via find_package; using external/eigen include path")
     target_include_directories(lsm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/eigen)
