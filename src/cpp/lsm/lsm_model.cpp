@@ -133,12 +133,12 @@ struct WorkState {
     std::vector<int> tau;    // exercise index in [0..steps]
 };
 
-inline void init_terminal(const Eigen::MatrixXd& S, int steps, double K, WorkState& st) {
-    const int paths = static_cast<int>(S.rows());
+inline void init_terminal_scaled(const Eigen::MatrixXd& S_base, double scale, int steps, double K, WorkState& st) {
+    const int paths = static_cast<int>(S_base.rows());
     st.cf.assign(paths, 0.0);
     st.tau.assign(paths, steps);
     for (int p = 0; p < paths; ++p) {
-        st.cf[p] = put_payoff(S(p, steps), K);
+        st.cf[p] = put_payoff(scale * S_base(p, steps), K);
         st.tau[p] = steps;
     }
 }
@@ -163,7 +163,7 @@ Policy train_policy_lsm(
     const int n_train = static_cast<int>(S_train.rows());
 
     WorkState tr;
-    init_terminal(S_train, steps, K, tr);
+    init_terminal_scaled(S_train, 1.0, steps, K, tr);
 
     Policy pol;
     pol.beta.resize(steps + 1);
@@ -220,9 +220,10 @@ Policy train_policy_lsm(
     return pol;
 }
 
-// Apply a trained policy to a set of test paths to produce discounted time-0 cashflows X[p]
-std::vector<double> apply_policy_to_test(
-    const Eigen::MatrixXd& S_test,
+// Apply a trained policy to scaled test paths (no bumped matrix allocation).
+std::vector<double> apply_policy_to_test_scaled(
+    const Eigen::MatrixXd& S_test_base,
+    double scale,
     const Policy& pol,
     double K,
     int steps,
@@ -231,16 +232,17 @@ std::vector<double> apply_policy_to_test(
     int deg,
     BasisType basis
 ) {
-    const int n_test = static_cast<int>(S_test.rows());
+    const int n_test = static_cast<int>(S_test_base.rows());
+
     WorkState te;
-    init_terminal(S_test, steps, K, te);
+    init_terminal_scaled(S_test_base, scale, steps, K, te);
 
     for (int n = steps - 1; n >= 1; --n) {
         if (!pol.has_beta[n]) continue;
         const Eigen::VectorXd& beta = pol.beta[n];
 
         for (int p = 0; p < n_test; ++p) {
-            const double Sn = S_test(p, n);
+            const double Sn = scale * S_test_base(p, n);
             const double exercise = put_payoff(Sn, K);
             if (exercise <= 0.0) continue;
 
@@ -315,7 +317,7 @@ LSMPriceResult price_bermudan_put_lsm(
 
     Policy pol = train_policy_lsm(S_train, K, steps, r, dt, disc_step, deg, cfg.basis, cfg.ridge);
 
-    std::vector<double> X = apply_policy_to_test(S_test, pol, K, steps, dt, disc_step, deg, cfg.basis);
+    std::vector<double> X = apply_policy_to_test_scaled(S_test, 1.0, pol, K, steps, dt, disc_step, deg, cfg.basis);
 
     double price = mean_of(X);
 
@@ -361,7 +363,7 @@ LSMPriceResult price_bermudan_put_lsm(
 }
 
 // --------------------
-// Step 3: price + delta (CRN, frozen regression)
+// Step 3: price + delta (CRN, frozen regression) with lazy scaling bumps
 // --------------------
 LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     double S0,
@@ -377,6 +379,9 @@ LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     if (!(K > 0.0)) throw std::invalid_argument("K must be > 0");
     if (!(T > 0.0)) throw std::invalid_argument("T must be > 0");
     if (!(eps_rel > 0.0)) throw std::invalid_argument("eps_rel must be > 0");
+    if (eps_rel < 1e-6) throw std::invalid_argument("eps_rel too small (< 1e-6)");
+    if (eps_rel > 1e-2) throw std::invalid_argument("eps_rel too large (> 1e-2)");
+
     if (cfg.steps <= 0) throw std::invalid_argument("cfg.steps must be > 0");
     if (cfg.paths <= 10) throw std::invalid_argument("cfg.paths must be reasonably large");
     if (!(cfg.train_fraction > 0.0 && cfg.train_fraction < 1.0))
@@ -393,22 +398,21 @@ LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     std::vector<double> disc_step(steps + 1, 1.0);
     for (int k = 1; k <= steps; ++k) disc_step[k] = std::exp(-r * dt * static_cast<double>(k));
 
-    // Base simulation (train/test) — CRN for bumps will reuse test shocks implicitly via scaling.
     Eigen::MatrixXd S_train = simulate_gbm(n_train, steps, S0, r, q, sigma, T, cfg.seed, cfg.antithetic);
     Eigen::MatrixXd S_test  = simulate_gbm(n_test,  steps, S0, r, q, sigma, T, cfg.seed + 1, cfg.antithetic);
 
-    // Train once at base S0
     Policy pol = train_policy_lsm(S_train, K, steps, r, dt, disc_step, deg, cfg.basis, cfg.ridge);
 
-    // Price base on test set
-    std::vector<double> X0 = apply_policy_to_test(S_test, pol, K, steps, dt, disc_step, deg, cfg.basis);
+    // Base price on test set
+    std::vector<double> X0 = apply_policy_to_test_scaled(S_test, 1.0, pol, K, steps, dt, disc_step, deg, cfg.basis);
     double price0 = mean_of(X0);
 
-    // Optional control variate (base only)
+    // Optional control variate on base price
     std::vector<double> X0_used = X0;
     if (cfg.use_control_variate) {
         const double bs = black_scholes_put(S0, K, r, q, sigma, T);
         const double discT = std::exp(-r * T);
+
         std::vector<double> Y(n_test, 0.0);
         for (int p = 0; p < n_test; ++p) Y[p] = discT * put_payoff(S_test(p, steps), K);
 
@@ -431,8 +435,7 @@ LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     }
     const double price_stderr = stderr_of(X0_used, price0);
 
-    // CRN finite-diff delta with frozen regression:
-    // Under GBM, paths scale linearly with S0 for fixed shocks => S_test_bump = S_test * (S0_bump/S0)
+    // CRN finite-difference delta with frozen regression + lazy scaling
     const double eps = eps_rel * S0;
     const double S_up = S0 + eps;
     const double S_dn = S0 - eps;
@@ -441,14 +444,9 @@ LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     const double scale_up = S_up / S0;
     const double scale_dn = S_dn / S0;
 
-    Eigen::MatrixXd S_test_up = S_test * scale_up;
-    Eigen::MatrixXd S_test_dn = S_test * scale_dn;
+    std::vector<double> Xup = apply_policy_to_test_scaled(S_test, scale_up, pol, K, steps, dt, disc_step, deg, cfg.basis);
+    std::vector<double> Xdn = apply_policy_to_test_scaled(S_test, scale_dn, pol, K, steps, dt, disc_step, deg, cfg.basis);
 
-    // Apply same trained policy (betas) to bumped test paths
-    std::vector<double> Xup = apply_policy_to_test(S_test_up, pol, K, steps, dt, disc_step, deg, cfg.basis);
-    std::vector<double> Xdn = apply_policy_to_test(S_test_dn, pol, K, steps, dt, disc_step, deg, cfg.basis);
-
-    // Delta estimator using per-path CRN differences (good variance reduction)
     std::vector<double> di(n_test, 0.0);
     for (int p = 0; p < n_test; ++p) di[p] = (Xup[p] - Xdn[p]) / (2.0 * eps);
 
