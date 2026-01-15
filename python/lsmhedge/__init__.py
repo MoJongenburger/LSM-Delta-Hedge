@@ -94,3 +94,7 @@ def price_and_delta_bermudan_put(
         float(S0), float(K), float(r), float(q), float(sigma), float(T), float(eps_rel), cfg
     )
     return float(res.price), float(res.delta), float(res.price_stderr), float(res.delta_stderr)
+
+from .data import MarketDataConfig, prepare_market_data
+from .hedge import HedgeConfig, run_single_trade_delta_hedge
+
