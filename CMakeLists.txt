@@ -19,7 +19,7 @@ target_include_directories(lsm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Eigen: prefer system Eigen3, fallback to external/eigen (submodule)
+# Eigen: prefer system Eigen3, fallback to external/eigen (submodule or vendored folder)
 find_package(Eigen3 QUIET)
 if (Eigen3_FOUND)
     target_link_libraries(lsm_core PUBLIC Eigen3::Eigen)
@@ -35,21 +35,26 @@ add_executable(test_smoke tests/cpp/test_smoke.cpp)
 target_link_libraries(test_smoke PRIVATE lsm_core)
 
 # ----------------------------
-# pybind11 (system or submodule)
+# pybind11: system-first (pip), else submodule fallback
 # ----------------------------
-option(USE_SYSTEM_PYBIND11 "Use system pybind11 if found" OFF)
+option(USE_SYSTEM_PYBIND11 "Use system-installed pybind11 if found" ON)
 
 if (USE_SYSTEM_PYBIND11)
-    find_package(pybind11 CONFIG REQUIRED)
+    find_package(pybind11 CONFIG QUIET)
+endif()
+
+if (pybind11_FOUND)
+    message(STATUS "Using system pybind11 (found via CMake config)")
 else()
+    message(STATUS "System pybind11 not found; trying submodule external/pybind11")
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/pybind11/CMakeLists.txt")
-        message(FATAL_ERROR "pybind11 submodule not found. Run: git submodule update --init --recursive")
+        message(FATAL_ERROR "pybind11 not found. Install pybind11 (pip) or add submodule at external/pybind11.")
     endif()
     add_subdirectory(external/pybind11)
 endif()
 
 # ----------------------------
-# PYBIND11 MODULE
+# PYBIND11 MODULE (Python extension)
 # ----------------------------
 pybind11_add_module(lsm_cpp
     src/cpp/bindings/pybind_module.cpp
@@ -77,14 +82,13 @@ elseif(UNIX)
 endif()
 
 # ----------------------------
-# Install target (puts extension under lsmhedge/)
+# Install target (optional; CI doesn't need it)
 # ----------------------------
 if (DEFINED Python3_SITELIB)
     set(PY_SITE_DIR "${Python3_SITELIB}")
 elseif(DEFINED Python3_SITEARCH)
     set(PY_SITE_DIR "${Python3_SITEARCH}")
 else()
-    # fallback
     set(PY_SITE_DIR "python")
 endif()
 
