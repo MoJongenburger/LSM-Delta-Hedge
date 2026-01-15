@@ -5,14 +5,14 @@
 namespace lsm {
 
 enum class BasisType {
-    Monomial,   // [1, x, x^2, ...]
-    Laguerre    // Laguerre polynomials (better conditioned)
+    Monomial,
+    Laguerre
 };
 
 struct LSMConfig {
-    int steps = 252;                 // Daily grid for ~1y
-    int paths = 100000;              // Total paths = train + test
-    double train_fraction = 0.5;     // 0<frac<1; used for out-of-sample regression
+    int steps = 252;
+    int paths = 100000;
+    double train_fraction = 0.5;
     std::uint64_t seed = 42;
 
     int basis_degree = 2;
@@ -20,10 +20,8 @@ struct LSMConfig {
 
     bool antithetic = true;
 
-    // Ridge regression strength (Tikhonov). Use ~1e-8 for stability.
     double ridge = 1e-8;
 
-    // Optional European-put control variate for variance reduction.
     bool use_control_variate = true;
 };
 
@@ -32,6 +30,14 @@ struct LSMPriceResult {
     double mc_stderr = 0.0;
 };
 
+struct LSMPriceDeltaResult {
+    double price = 0.0;        // time-0 price on test set (possibly CV-adjusted)
+    double delta = 0.0;        // CRN finite-diff delta, using frozen regression betas
+    double price_stderr = 0.0; // MC stderr of price estimator
+    double delta_stderr = 0.0; // MC stderr of delta estimator
+};
+
+// Step 1 function (price only)
 LSMPriceResult price_bermudan_put_lsm(
     double S0,
     double K,
@@ -42,5 +48,16 @@ LSMPriceResult price_bermudan_put_lsm(
     const LSMConfig& cfg
 );
 
-} // namespace lsm
+// Step 3 function (price + delta, no retraining for bumps)
+LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
+    double S0,
+    double K,
+    double r,
+    double q,
+    double sigma,
+    double T,
+    double eps_rel,      // e.g. 1e-4 => eps = eps_rel * S0
+    const LSMConfig& cfg
+);
 
+} // namespace lsm
