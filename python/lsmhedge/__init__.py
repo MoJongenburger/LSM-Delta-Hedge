@@ -46,9 +46,6 @@ def price_bermudan_put(
     T: float,
     **cfg_kwargs: Any
 ) -> Tuple[float, float]:
-    """
-    Returns: (price, mc_stderr)
-    """
     _require_cpp()
 
     if S0 <= 0 or K <= 0:
@@ -81,9 +78,6 @@ def price_and_delta_bermudan_put(
     eps_rel: float = 1e-4,
     **cfg_kwargs: Any
 ) -> Tuple[float, float, float, float]:
-    """
-    Returns: (price, delta, price_stderr, delta_stderr)
-    """
     _require_cpp()
 
     if S0 <= 0 or K <= 0:
