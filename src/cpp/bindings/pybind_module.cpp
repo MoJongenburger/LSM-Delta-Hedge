@@ -1,10 +1,23 @@
 #include <pybind11/pybind11.h>
+#include <stdexcept>
+
 #include "src/cpp/lsm/lsm_model.h"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(lsm_cpp, m) {
     m.doc() = "C++ LSM Bermudan put pricer (Eigen + pybind11)";
+
+    // Translate common C++ exceptions into nicer Python exceptions
+    py::register_exception_translator([](std::exception_ptr p) {
+        try {
+            if (p) std::rethrow_exception(p);
+        } catch (const std::invalid_argument& e) {
+            PyErr_SetString(PyExc_ValueError, e.what());
+        } catch (const std::runtime_error& e) {
+            PyErr_SetString(PyExc_RuntimeError, e.what());
+        }
+    });
 
     py::enum_<lsm::BasisType>(m, "BasisType")
         .value("Monomial", lsm::BasisType::Monomial)
