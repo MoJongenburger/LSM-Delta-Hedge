@@ -36,16 +36,10 @@ jobs:
         run: |
           cmake --build build -j
 
-      - name: Make extension importable for tests
-        run: |
-          # Copy built extension into the Python package directory
-          mkdir -p python/lsmhedge
-          cp build/lsm_cpp*.so python/lsmhedge/
-
       - name: Run C++ smoke test
         run: |
           ./build/test_smoke
 
       - name: Run Python tests
         run: |
-          PYTHONPATH=python pytest -q
+          PYTHONPATH=python:build pytest -q
