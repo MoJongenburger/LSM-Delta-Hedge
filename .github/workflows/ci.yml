@@ -36,10 +36,20 @@ jobs:
         run: |
           cmake --build build -j
 
+      - name: Copy extension into package
+        run: |
+          ls -la build | sed -n '1,120p'
+          mkdir -p python/lsmhedge
+          cp -v build/lsm_cpp*.so python/lsmhedge/
+
+      - name: Import check (must succeed)
+        run: |
+          PYTHONPATH=python python -c "import lsmhedge; print('Imported lsmhedge'); import lsmhedge.lsm_cpp as m; print('Imported extension:', m.__doc__[:80] if m.__doc__ else 'OK')"
+
       - name: Run C++ smoke test
         run: |
           ./build/test_smoke
 
       - name: Run Python tests
         run: |
-          PYTHONPATH=python:build pytest -q
+          PYTHONPATH=python pytest -q
