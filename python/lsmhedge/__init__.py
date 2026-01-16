@@ -2,75 +2,48 @@ from __future__ import annotations
 
 from typing import Any, Tuple
 import warnings
-import sys
-from pathlib import Path
+import importlib
 
-lsm_cpp = None
-_import_error = []  # list of ("attempt", "error repr")
+# We keep a module-level cache of the loaded extension module.
+_lsm_cpp = None
 
 
-def _try_import_cpp() -> None:
+def _load_cpp():
     """
-    Robust import logic:
-    1) try package-local extension: lsmhedge/lsm_cpp*.so
-    2) try top-level: import lsm_cpp
-    3) try adding repo_root/build to sys.path then import lsm_cpp
+    Load the compiled extension in a deterministic way.
+
+    Priority:
+      1) package-local extension: lsmhedge.lsm_cpp  (this is what CI copies in)
+      2) top-level module: lsm_cpp                 (if user put build/ on PYTHONPATH)
     """
-    global lsm_cpp, _import_error
+    global _lsm_cpp
+    if _lsm_cpp is not None:
+        return _lsm_cpp
+
     errors = []
 
-    # 1) package-local extension
+    # 1) Force package-local import (this avoids stub/import edge cases)
     try:
-        from . import lsm_cpp as _m  # type: ignore
-        lsm_cpp = _m
-        _import_error = []
-        return
+        _lsm_cpp = importlib.import_module("lsmhedge.lsm_cpp")
+        return _lsm_cpp
     except Exception as e:
-        errors.append(("package-local", repr(e)))
+        errors.append(("lsmhedge.lsm_cpp", repr(e)))
 
-    # 2) top-level import
+    # 2) Fallback: top-level module import
     try:
-        import lsm_cpp as _m  # type: ignore
-        lsm_cpp = _m
-        _import_error = []
-        return
+        _lsm_cpp = importlib.import_module("lsm_cpp")
+        return _lsm_cpp
     except Exception as e:
-        errors.append(("top-level", repr(e)))
+        errors.append(("lsm_cpp", repr(e)))
 
-    # 3) repo_root/build fallback (useful for CI/local builds)
-    try:
-        repo_root = Path(__file__).resolve().parents[2]  # .../python/lsmhedge/__init__.py -> repo root
-        build_dir = repo_root / "build"
-        if build_dir.exists():
-            sys.path.insert(0, str(build_dir))
-        import lsm_cpp as _m  # type: ignore
-        lsm_cpp = _m
-        _import_error = []
-        return
-    except Exception as e:
-        errors.append(("repo-build", repr(e)))
-
-    lsm_cpp = None
-    _import_error = errors
-
-
-def _require_cpp() -> None:
-    """
-    IMPORTANT: Always attempt import on-demand.
-    This avoids pytest/import-order edge cases where module-level init might not have run as expected.
-    """
-    global lsm_cpp
-    if lsm_cpp is None:
-        _try_import_cpp()
-    if lsm_cpp is None:
-        raise ImportError(
-            "C++ extension module not found. Build it via CMake/pybind11.\n"
-            f"Import attempts failed with: {_import_error}"
-        )
+    raise ImportError(
+        "C++ extension module not found. Build it via CMake/pybind11.\n"
+        f"Import attempts failed with: {errors}"
+    )
 
 
 def _build_cfg(**cfg_kwargs: Any):
-    _require_cpp()
+    lsm_cpp = _load_cpp()
     cfg = lsm_cpp.LSMConfig()
     for k, v in cfg_kwargs.items():
         if not hasattr(cfg, k):
@@ -90,7 +63,7 @@ def price_bermudan_put(
     T: float,
     **cfg_kwargs: Any
 ) -> Tuple[float, float]:
-    _require_cpp()
+    lsm_cpp = _load_cpp()
 
     if S0 <= 0 or K <= 0:
         raise ValueError("S0 and K must be > 0")
@@ -122,7 +95,7 @@ def price_and_delta_bermudan_put(
     eps_rel: float = 1e-4,
     **cfg_kwargs: Any
 ) -> Tuple[float, float, float, float]:
-    _require_cpp()
+    lsm_cpp = _load_cpp()
 
     if S0 <= 0 or K <= 0:
         raise ValueError("S0 and K must be > 0")
