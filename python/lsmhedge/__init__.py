@@ -6,14 +6,20 @@ import sys
 from pathlib import Path
 
 lsm_cpp = None
-_import_error = []  # always a list of exceptions / messages
+_import_error = []  # list of ("attempt", "error repr")
 
 
 def _try_import_cpp() -> None:
+    """
+    Robust import logic:
+    1) try package-local extension: lsmhedge/lsm_cpp*.so
+    2) try top-level: import lsm_cpp
+    3) try adding repo_root/build to sys.path then import lsm_cpp
+    """
     global lsm_cpp, _import_error
     errors = []
 
-    # 1) package-local extension (preferred)
+    # 1) package-local extension
     try:
         from . import lsm_cpp as _m  # type: ignore
         lsm_cpp = _m
@@ -22,7 +28,7 @@ def _try_import_cpp() -> None:
     except Exception as e:
         errors.append(("package-local", repr(e)))
 
-    # 2) top-level import (if module on sys.path)
+    # 2) top-level import
     try:
         import lsm_cpp as _m  # type: ignore
         lsm_cpp = _m
@@ -31,9 +37,9 @@ def _try_import_cpp() -> None:
     except Exception as e:
         errors.append(("top-level", repr(e)))
 
-    # 3) add repo_root/build to sys.path and try again
+    # 3) repo_root/build fallback (useful for CI/local builds)
     try:
-        repo_root = Path(__file__).resolve().parents[2]
+        repo_root = Path(__file__).resolve().parents[2]  # .../python/lsmhedge/__init__.py -> repo root
         build_dir = repo_root / "build"
         if build_dir.exists():
             sys.path.insert(0, str(build_dir))
@@ -44,13 +50,18 @@ def _try_import_cpp() -> None:
     except Exception as e:
         errors.append(("repo-build", repr(e)))
 
+    lsm_cpp = None
     _import_error = errors
 
 
-_try_import_cpp()
-
-
 def _require_cpp() -> None:
+    """
+    IMPORTANT: Always attempt import on-demand.
+    This avoids pytest/import-order edge cases where module-level init might not have run as expected.
+    """
+    global lsm_cpp
+    if lsm_cpp is None:
+        _try_import_cpp()
     if lsm_cpp is None:
         raise ImportError(
             "C++ extension module not found. Build it via CMake/pybind11.\n"
@@ -59,6 +70,7 @@ def _require_cpp() -> None:
 
 
 def _build_cfg(**cfg_kwargs: Any):
+    _require_cpp()
     cfg = lsm_cpp.LSMConfig()
     for k, v in cfg_kwargs.items():
         if not hasattr(cfg, k):
