@@ -2,27 +2,63 @@ from __future__ import annotations
 
 from typing import Any, Tuple
 import warnings
+import sys
+from pathlib import Path
 
 lsm_cpp = None
 _import_error = None
 
-# Try package-local extension first, then fallback to top-level
-try:
-    from . import lsm_cpp as _lsm_cpp  # type: ignore
-    lsm_cpp = _lsm_cpp
-except Exception as e1:
+
+def _try_import_cpp() -> None:
+    """
+    Robust import logic:
+    1) try package-local extension: lsmhedge/lsm_cpp*.so
+    2) try top-level: import lsm_cpp
+    3) try adding repo_root/build to sys.path then import lsm_cpp
+       (useful for CI + local builds when not installed)
+    """
+    global lsm_cpp, _import_error
+    errors = []
+
+    # 1) package-local
     try:
-        import lsm_cpp as _lsm_cpp  # type: ignore
-        lsm_cpp = _lsm_cpp
-    except Exception as e2:
-        _import_error = (e1, e2)
+        from . import lsm_cpp as _m  # type: ignore
+        lsm_cpp = _m
+        return
+    except Exception as e:
+        errors.append(e)
+
+    # 2) top-level
+    try:
+        import lsm_cpp as _m  # type: ignore
+        lsm_cpp = _m
+        return
+    except Exception as e:
+        errors.append(e)
+
+    # 3) add repo_root/build and try again
+    try:
+        repo_root = Path(__file__).resolve().parents[2]  # .../python/lsmhedge/__init__.py -> repo root
+        build_dir = repo_root / "build"
+        if build_dir.exists():
+            sys.path.insert(0, str(build_dir))
+        import lsm_cpp as _m  # type: ignore
+        lsm_cpp = _m
+        return
+    except Exception as e:
+        errors.append(e)
+
+    _import_error = errors
+
+
+_try_import_cpp()
 
 
 def _require_cpp() -> None:
     if lsm_cpp is None:
         raise ImportError(
             "C++ extension module not found. Build it via CMake/pybind11.\n"
-            f"Original errors: {_import_error}"
+            f"Import attempts failed with: {_import_error}"
         )
 
 
@@ -94,7 +130,3 @@ def price_and_delta_bermudan_put(
         float(S0), float(K), float(r), float(q), float(sigma), float(T), float(eps_rel), cfg
     )
     return float(res.price), float(res.delta), float(res.price_stderr), float(res.delta_stderr)
-
-from .data import MarketDataConfig, prepare_market_data
-from .hedge import HedgeConfig, run_single_trade_delta_hedge
-
