@@ -6,47 +6,43 @@ import sys
 from pathlib import Path
 
 lsm_cpp = None
-_import_error = None
+_import_error = []  # always a list of exceptions / messages
 
 
 def _try_import_cpp() -> None:
-    """
-    Robust import logic:
-    1) try package-local extension: lsmhedge/lsm_cpp*.so
-    2) try top-level: import lsm_cpp
-    3) try adding repo_root/build to sys.path then import lsm_cpp
-       (useful for CI + local builds when not installed)
-    """
     global lsm_cpp, _import_error
     errors = []
 
-    # 1) package-local
+    # 1) package-local extension (preferred)
     try:
         from . import lsm_cpp as _m  # type: ignore
         lsm_cpp = _m
+        _import_error = []
         return
     except Exception as e:
-        errors.append(e)
+        errors.append(("package-local", repr(e)))
 
-    # 2) top-level
+    # 2) top-level import (if module on sys.path)
     try:
         import lsm_cpp as _m  # type: ignore
         lsm_cpp = _m
+        _import_error = []
         return
     except Exception as e:
-        errors.append(e)
+        errors.append(("top-level", repr(e)))
 
-    # 3) add repo_root/build and try again
+    # 3) add repo_root/build to sys.path and try again
     try:
-        repo_root = Path(__file__).resolve().parents[2]  # .../python/lsmhedge/__init__.py -> repo root
+        repo_root = Path(__file__).resolve().parents[2]
         build_dir = repo_root / "build"
         if build_dir.exists():
             sys.path.insert(0, str(build_dir))
         import lsm_cpp as _m  # type: ignore
         lsm_cpp = _m
+        _import_error = []
         return
     except Exception as e:
-        errors.append(e)
+        errors.append(("repo-build", repr(e)))
 
     _import_error = errors
 
