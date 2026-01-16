@@ -35,14 +35,13 @@ def test_hedge_atm_no_tc_smoke():
         use_cache=False,
     )
     path, report = run_single_trade_delta_hedge(md, cfg)
+
     assert len(path) >= 10
     assert np.isfinite(report["final_pnl"])
 
 
 def test_hedge_exercise_detection_triggers_deep_itm():
-    # Deep ITM put: set K fixed high relative to S
     md = _synthetic_market(40)
-    # Make underlying fall so payoff becomes large and time value collapses
     md["close"] = np.linspace(120.0, 80.0, len(md))
 
     cfg = HedgeConfig(
@@ -63,5 +62,6 @@ def test_hedge_exercise_detection_triggers_deep_itm():
         use_cache=False,
     )
     path, report = run_single_trade_delta_hedge(md, cfg)
+
     # Should exercise before end in a deep ITM, low-time-value scenario (heuristic)
-    assert path["option_alive"].iloc[-1] is False
+    assert bool(path["option_alive"].iloc[-1]) is False
