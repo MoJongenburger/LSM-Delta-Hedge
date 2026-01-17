@@ -9,6 +9,7 @@ import pandas as pd
 
 from . import price_and_delta_bermudan_put
 from .metrics import summarize_hedge, as_dict
+from .model_cache import LSMModelManager, RecalibrationConfig
 
 
 @dataclass
@@ -27,16 +28,20 @@ class HedgeConfig:
     # costs
     tc_bps: float = 0.0
 
-    # early exercise heuristic:
-    # For Bermudan/American: option_value >= intrinsic always (no-arb).
-    # We approximate the exercise region when time value ~ 0:
-    #    option_price - payoff <= k * price_stderr
-    # plus a robustness gate that delta is sufficiently close to -1 (deep ITM put).
+    # early exercise heuristic
     exercise_detection: bool = True
     exercise_k_stderr: float = 2.0
     exercise_delta_gate: float = -0.95
 
-    # speed: optional LRU caching of pricing calls using rounded state (approximate!)
+    # ===== Desk-dev upgrade =====
+    use_stateful_model: bool = True
+    recalibration_policy: str = "weekly"     # "daily" | "weekly" | "sigma_threshold"
+    recalibration_days: int = 5
+    sigma_rel_threshold: float = 0.15
+    r_abs_threshold: float = 0.005
+    q_abs_threshold: float = 0.005
+
+    # legacy quote cache (kept for fallback stateless mode)
     use_cache: bool = False
     cache_maxsize: int = 512
     cache_round_S: int = 2
@@ -56,16 +61,11 @@ class HedgeConfig:
                 "antithetic": True,
                 "ridge": 1e-8,
                 "use_control_variate": True,
-                "seed": 42,  # deterministic by default
+                "seed": 42,
             }
 
 
 class LRUQuoteCache:
-    """
-    LRU cache for (price, delta, price_se, delta_se) quotes.
-    NOTE: This is approximate: rounding makes cache hits possible.
-    Correct caching for a desk would be a reusable C++ model object (Step 6).
-    """
     def __init__(self, maxsize: int = 512):
         self.maxsize = int(maxsize)
         self._d: "OrderedDict[Tuple[float, float, float, float, float], Tuple[float, float, float, float]]" = OrderedDict()
@@ -105,17 +105,6 @@ def run_single_trade_delta_hedge(
     cfg: HedgeConfig,
     start_date: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    market must have columns: close, sigma, r, q (DatetimeIndex).
-
-    Book accounting:
-      book_value = cash + stock*S - option_price
-      cash accrues at r (continuous comp, daily dt=1/252)
-      transaction cost = bps of notional traded
-
-    At t=0:
-      receive premium first, then hedge to delta.
-    """
     for col in ["close", "sigma", "r", "q"]:
         if col not in market.columns:
             raise ValueError(f"market missing column: {col}")
@@ -153,7 +142,21 @@ def run_single_trade_delta_hedge(
     stock = np.float64(0.0)
     option_alive = True
 
-    cache = LRUQuoteCache(cfg.cache_maxsize) if cfg.use_cache else None
+    # desk-dev: stateful model manager
+    manager = None
+    if cfg.use_stateful_model:
+        rcfg = RecalibrationConfig(
+            policy=cfg.recalibration_policy,
+            recalibration_days=cfg.recalibration_days,
+            sigma_rel_threshold=cfg.sigma_rel_threshold,
+            r_abs_threshold=cfg.r_abs_threshold,
+            q_abs_threshold=cfg.q_abs_threshold,
+        )
+        manager = LSMModelManager(cfg.engine_cfg, trading_days=cfg.trading_days, rcfg=rcfg)
+
+    # legacy stateless cache
+    cache = LRUQuoteCache(cfg.cache_maxsize) if (cfg.use_cache and not cfg.use_stateful_model) else None
+
     rows = []
 
     for i in range(n):
@@ -163,13 +166,13 @@ def run_single_trade_delta_hedge(
         r = float(path["r"].iloc[i])
         q = float(path["q"].iloc[i])
 
-        # cash accrual from previous day to today
         if i > 0:
             r_prev = float(path["r"].iloc[i - 1])
             dt = 1.0 / float(cfg.trading_days)
             cash = np.float64(float(cash) * float(np.exp(r_prev * dt)))
 
-        T_rem = float((n - 1 - i) / float(cfg.trading_days))
+        remaining_days = int(n - 1 - i)
+        T_rem = float(remaining_days / float(cfg.trading_days))
         payoff = max(K - S, 0.0)
 
         trade = 0.0
@@ -179,45 +182,56 @@ def run_single_trade_delta_hedge(
         price_se = 0.0
         delta_se = 0.0
         exercised_now = False
+        rebuilt_model = False
+        model_age = None
 
         if option_alive:
-            if T_rem <= 0.0:
+            if remaining_days <= 0:
                 option_price = payoff
                 delta = -1.0 if S < K else 0.0
             else:
-                if cache is not None:
-                    key = _cache_key(S, sigma, r, q, T_rem, cfg)
-                    hit = cache.get(key)
-                    if hit is not None:
-                        option_price, delta, price_se, delta_se = hit
+                if cfg.use_stateful_model and manager is not None:
+                    option_price, delta, price_se, delta_se, rebuilt_model, model_age = manager.quote(
+                        day_idx=i,
+                        remaining_days=remaining_days,
+                        S=S,
+                        K=K,
+                        r=r,
+                        q=q,
+                        sigma=sigma,
+                        eps_rel=cfg.eps_rel,
+                    )
+                else:
+                    # stateless path (old behavior)
+                    if cache is not None:
+                        key = _cache_key(S, sigma, r, q, T_rem, cfg)
+                        hit = cache.get(key)
+                        if hit is not None:
+                            option_price, delta, price_se, delta_se = hit
+                        else:
+                            option_price, delta, price_se, delta_se = price_and_delta_bermudan_put(
+                                S0=S, K=K, r=r, q=q, sigma=sigma, T=T_rem, eps_rel=cfg.eps_rel, **cfg.engine_cfg
+                            )
+                            cache.put(key, (option_price, delta, price_se, delta_se))
                     else:
                         option_price, delta, price_se, delta_se = price_and_delta_bermudan_put(
                             S0=S, K=K, r=r, q=q, sigma=sigma, T=T_rem, eps_rel=cfg.eps_rel, **cfg.engine_cfg
                         )
-                        cache.put(key, (option_price, delta, price_se, delta_se))
-                else:
-                    option_price, delta, price_se, delta_se = price_and_delta_bermudan_put(
-                        S0=S, K=K, r=r, q=q, sigma=sigma, T=T_rem, eps_rel=cfg.eps_rel, **cfg.engine_cfg
-                    )
 
-            # Early exercise heuristic: time value approx zero + delta gate
-            if cfg.exercise_detection and payoff > 0.0 and T_rem > 0.0:
+            if cfg.exercise_detection and payoff > 0.0 and remaining_days > 0:
                 time_value = float(option_price - payoff)
                 if (time_value <= float(cfg.exercise_k_stderr) * float(max(price_se, 0.0))) and (float(delta) <= float(cfg.exercise_delta_gate)):
                     exercised_now = True
 
-            # --- t=0: receive premium first ---
             if i == 0:
                 cash = np.float64(float(cash) + float(option_price))
 
-            # rebalance hedge at close
             target_stock = np.float64(float(delta))
             trade = float(target_stock - stock)
             tcost = _tc_cost(trade, S, cfg.tc_bps)
             cash = np.float64(float(cash) - trade * S - tcost)
             stock = target_stock
 
-            # if exercised, settle payoff and flatten hedge (include TC)
             if exercised_now:
                 cash = np.float64(float(cash) - payoff)
 
@@ -258,6 +272,8 @@ def run_single_trade_delta_hedge(
                 "exercised_now": bool(exercised_now),
                 "option_alive": bool(option_alive),
                 "book_value": float(book_value),
+                "model_rebuilt": bool(rebuilt_model),
+                "model_age_steps": (int(model_age) if model_age is not None else None),
             }
         )
 
