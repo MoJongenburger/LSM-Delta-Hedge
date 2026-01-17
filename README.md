@@ -40,18 +40,18 @@ We simulate the **hedged book** for a **short Bermudan put** on SPY:
 We compute features using only information available at time *t*:
 
 - **Close prices** from Yahoo Finance.
-- **Log returns:** `log(S_t / S_{t-1})`.
+- **Log returns:** `$log(S_t / S_{t-1})$`.
 - **Realized vol:** rolling window standard deviation of log returns, annualized:
-  \[
+  $$
   \sigma_t = \mathrm{std}(\text{logret}) \sqrt{252}
-  \]
+  $$
   shifted by one day to avoid look-ahead.
 
 ### 2) Risk-neutral model and LSM pricing
 We assume GBM under Q:
-\[
+$$
 \frac{dS_t}{S_t} = (r-q)\,dt + \sigma\,dW_t
-\]
+$$
 
 LSM algorithm:
 - Simulate Monte Carlo paths.
@@ -66,9 +66,9 @@ Key engineering choices:
 
 ### 3) Delta estimation (CRN finite differences + frozen regression)
 Delta uses central differences with common random numbers (CRN):
-\[
+$$
 \Delta \approx \frac{C(S+\epsilon)-C(S-\epsilon)}{2\epsilon}, \quad \epsilon = 10^{-4}S
-\]
+$$
 
 We avoid retraining regressions for bumps:
 - Train LSM regression once (betas frozen),
@@ -76,26 +76,26 @@ We avoid retraining regressions for bumps:
 
 ### 4) Hedging simulator (book accounting)
 We track the marked hedged book:
-\[
+$$
 V_t = \text{Cash}_t + \Delta_t S_t - C_t
-\]
+$$
 
 Cash accrues at continuous-compounded rate (daily):
-\[
+$$
 \text{Cash}_{t+\Delta t} = \text{Cash}_t e^{r\Delta t} - (\Delta_t-\Delta_{t-1})S_t - \text{TC}_t
-\]
+$$
 
 Transaction costs:
 - linear model in **bps of traded notional**:
-  \[
+  $$
   \text{TC}_t = \frac{\text{bps}}{10^4}\,|\Delta_t-\Delta_{t-1}|\,S_t
-  \]
+  $$
 
 Early exercise (pragmatic heuristic):
 - Bermudan/American value ≥ intrinsic; exercise region approximated when **time value ~ 0**:
-  \[
+  $$
   C_t - \text{payoff}_t \approx 0
-  \]
+  $$
   plus a delta gate (deep ITM put).
 
 ---
