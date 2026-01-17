@@ -1,4 +1,6 @@
 # LSM-Delta-Hedge
+![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 
 A **quant-desk style** project that implements a **C++ Longstaff–Schwartz (LSM) Bermudan put pricer** (Eigen) exposed to Python via **pybind11**, and a **historical delta-hedging simulator** on **SPY**.
 
