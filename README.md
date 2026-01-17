@@ -40,7 +40,7 @@ We simulate the **hedged book** for a **short Bermudan put** on SPY:
 We compute features using only information available at time *t*:
 
 - **Close prices** from Yahoo Finance.
-- **Log returns:** `$log(S_t / S_{t-1})$`.
+- **Log returns:** `log(S_t / S_{t-1})`.
 - **Realized vol:** rolling window standard deviation of log returns, annualized:
   $$
   \sigma_t = \mathrm{std}(\text{logret}) \sqrt{252}
