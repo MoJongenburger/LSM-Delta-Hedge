@@ -105,13 +105,14 @@ $$
   
 
 Early exercise (pragmatic heuristic):
-- Bermudan/American value ≥ intrinsic; exercise region approximated when **time value ~ 0**:
+- Bermudan/American value ≥ intrinsic; exercise region approximated when time value ~ 0:
 
-  $$
-  C_t - \text{payoff}_t \approx 0
-  $$
-  
-  plus a delta gate (deep ITM put).
+$$
+C_t - \mathrm{payoff}_t \approx 0
+$$
+
+plus a delta gate (deep ITM put).
+
 
 ---
 
