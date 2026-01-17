@@ -14,6 +14,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 # ----------------------------
 add_library(lsm_core
     src/cpp/lsm/lsm_model.cpp
+    src/cpp/lsm/lsm_model_object.cpp
 )
 set_target_properties(lsm_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
