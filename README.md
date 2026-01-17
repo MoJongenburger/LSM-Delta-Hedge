@@ -98,9 +98,10 @@ $$
 Transaction costs:
 - linear model in **bps of traded notional**:
   
-  $$
-  \text{TC}_t = \frac{\text{bps}}{10^4}\,|\Delta_t-\Delta_{t-1}|\,S_t
-  $$
+$$
+\mathrm{TC}_t = \frac{\mathrm{bps}}{10^4}\,|\Delta_t-\Delta_{t-1}|\,S_t
+$$
+
   
 
 Early exercise (pragmatic heuristic):
