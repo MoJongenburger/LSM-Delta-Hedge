@@ -75,10 +75,14 @@ $$
 \Delta \approx \frac{C(S+\epsilon)-C(S-\epsilon)}{2\epsilon}, \quad \epsilon = 10^{-4}S
 $$
 
-
 We avoid retraining regressions for bumps:
-- Train LSM regression once (betas frozen),
-- Re-apply the policy to bumped paths (CRN).
+- Train the LSM regression once (betas frozen),
+- Re-apply the learned exercise policy to bumped paths using CRN.
+
+**Note on alternatives (Pathwise / Likelihood Ratio):**  
+Pathwise (and Likelihood Ratio / LRM) estimators can compute Greeks in a single Monte Carlo pass and may be faster in smooth European settings.  
+We chose frozen-regression CRN finite differences for **robustness** in the presence of **early exercise and non-smooth payoffs**, where pathwise/LRM approaches can require additional care and are easier to get wrong in practice.
+
 
 ### 4) Hedging simulator (book accounting)
 We track the marked hedged book:
