@@ -33,7 +33,7 @@ class HedgeConfig:
     exercise_k_stderr: float = 2.0
     exercise_delta_gate: float = -0.95
 
-    # ===== Desk-dev upgrade =====
+    # desk-dev
     use_stateful_model: bool = True
     recalibration_policy: str = "weekly"     # "daily" | "weekly" | "sigma_threshold"
     recalibration_days: int = 5
@@ -41,7 +41,7 @@ class HedgeConfig:
     r_abs_threshold: float = 0.005
     q_abs_threshold: float = 0.005
 
-    # legacy quote cache (kept for fallback stateless mode)
+    # legacy cache
     use_cache: bool = False
     cache_maxsize: int = 512
     cache_round_S: int = 2
@@ -111,7 +111,6 @@ def run_single_trade_delta_hedge(
 
     df = market.copy().sort_index()
 
-    # choose start index
     if start_date is not None:
         start_ts = pd.to_datetime(start_date)
         start_idx = int(df.index.searchsorted(start_ts))
@@ -142,7 +141,8 @@ def run_single_trade_delta_hedge(
     stock = np.float64(0.0)
     option_alive = True
 
-    # desk-dev: stateful model manager
+    premium0 = np.nan  # store premium received at t=0 for reporting/metrics
+
     manager = None
     if cfg.use_stateful_model:
         rcfg = RecalibrationConfig(
@@ -154,7 +154,6 @@ def run_single_trade_delta_hedge(
         )
         manager = LSMModelManager(cfg.engine_cfg, trading_days=cfg.trading_days, rcfg=rcfg)
 
-    # legacy stateless cache
     cache = LRUQuoteCache(cfg.cache_maxsize) if (cfg.use_cache and not cfg.use_stateful_model) else None
 
     rows = []
@@ -202,7 +201,6 @@ def run_single_trade_delta_hedge(
                         eps_rel=cfg.eps_rel,
                     )
                 else:
-                    # stateless path (old behavior)
                     if cache is not None:
                         key = _cache_key(S, sigma, r, q, T_rem, cfg)
                         hit = cache.get(key)
@@ -224,6 +222,7 @@ def run_single_trade_delta_hedge(
                     exercised_now = True
 
             if i == 0:
+                premium0 = float(option_price)
                 cash = np.float64(float(cash) + float(option_price))
 
             target_stock = np.float64(float(delta))
@@ -274,6 +273,7 @@ def run_single_trade_delta_hedge(
                 "book_value": float(book_value),
                 "model_rebuilt": bool(rebuilt_model),
                 "model_age_steps": (int(model_age) if model_age is not None else None),
+                "premium0": float(premium0) if np.isfinite(premium0) else np.nan,
             }
         )
 
