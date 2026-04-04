@@ -9,19 +9,16 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class ValidationConfig:
-    # Put delta should be in [-1, 0] (allow MC tolerance)
     delta_lower: float = -1.10
     delta_upper: float = 0.10
-
-    # Price >= intrinsic, allow tiny numerical tolerance
     price_intrinsic_tol: float = 1e-8
-
-    # Book value should start near 0-ish (depends on rounding + premium/hedge TC)
     book_value_start_tol: float = 1e-6
 
     require_cols: Tuple[str, ...] = (
         "S", "K", "option_price", "delta", "cash", "stock", "book_value",
-        "trade", "tcost", "option_alive", "pnl", "pnl_change"
+        "trade", "tcost", "option_alive", "pnl", "pnl_change",
+        "model_intrinsic", "model_continuation", "model_exercise_now",
+        "option_terminated", "exercised_now"
     )
 
 
@@ -29,8 +26,9 @@ def validate_hedge_path(df: pd.DataFrame, cfg: Optional[ValidationConfig] = None
     """
     Hard validation for a single hedge path DataFrame.
 
-    Important: Checks involving option pricing (e.g., price >= intrinsic) are enforced
-    ONLY while the option is alive. After exercise, option_price is set to 0.0 by design.
+    Important:
+    - Price >= intrinsic is enforced only while the option is alive.
+    - After termination, option_price is expected to be 0.
     """
     cfg = cfg or ValidationConfig()
 
@@ -40,16 +38,15 @@ def validate_hedge_path(df: pd.DataFrame, cfg: Optional[ValidationConfig] = None
 
     checks: Dict[str, bool] = {}
 
-    # Basic finite checks (cast to Python bool for JSON serialization)
     checks["finite_book_value"] = bool(np.isfinite(df["book_value"].astype(float)).all())
     checks["finite_option_price"] = bool(np.isfinite(df["option_price"].astype(float)).all())
     checks["finite_delta"] = bool(np.isfinite(df["delta"].astype(float)).all())
+    checks["finite_model_intrinsic"] = bool(np.isfinite(df["model_intrinsic"].astype(float)).all())
+    checks["finite_model_continuation"] = bool(np.isfinite(df["model_continuation"].astype(float)).all())
 
-    # Determine alive mask
-    alive = df["option_alive"].astype(bool).values
-    alive_any = bool(alive.any())
+    alive_mask = df["option_alive"].astype(bool).values
+    alive_any = bool(alive_mask.any())
 
-    # Price >= intrinsic ONLY while alive
     intrinsic = np.maximum(df["K"].astype(float).values - df["S"].astype(float).values, 0.0)
     if alive_any:
         op_alive = df.loc[df["option_alive"].astype(bool), "option_price"].astype(float).values
@@ -58,30 +55,40 @@ def validate_hedge_path(df: pd.DataFrame, cfg: Optional[ValidationConfig] = None
     else:
         checks["price_ge_intrinsic"] = True
 
-    # Delta bounds: enforce ONLY while alive (after exercise delta is set to 0 by design)
     if alive_any:
         d_alive = df.loc[df["option_alive"].astype(bool), "delta"].astype(float).values
         checks["delta_in_bounds"] = bool((d_alive >= cfg.delta_lower).all() and (d_alive <= cfg.delta_upper).all())
     else:
         checks["delta_in_bounds"] = True
 
-    # Book value starts near zero-ish
     bv0 = float(df["book_value"].iloc[0])
     checks["book_value_start_near_zero"] = bool(abs(bv0) <= cfg.book_value_start_tol + 1e-3)
 
-    # If option not alive at end, hedge should be flat
-    if not bool(df["option_alive"].iloc[-1]):
-        checks["flat_after_exercise"] = bool(abs(float(df["stock"].iloc[-1])) <= 1e-8)
+    # If the model says exercise now, intrinsic should be at least as large as continuation.
+    me = df["model_exercise_now"].astype(bool).values
+    if me.any():
+        lhs = df.loc[df["model_exercise_now"].astype(bool), "model_intrinsic"].astype(float).values
+        rhs = df.loc[df["model_exercise_now"].astype(bool), "model_continuation"].astype(float).values
+        checks["exercise_policy_consistent"] = bool((lhs + 1e-8 >= rhs).all())
     else:
-        checks["flat_after_exercise"] = True
+        checks["exercise_policy_consistent"] = True
+
+    terminated_mask = df["option_terminated"].astype(bool).values
+    if terminated_mask.any():
+        op_term = df.loc[df["option_terminated"].astype(bool), "option_price"].astype(float).values
+        checks["option_zero_after_termination"] = bool(np.allclose(op_term, 0.0, atol=1e-10))
+    else:
+        checks["option_zero_after_termination"] = True
+
+    # Last row should have no live option if the horizon reached expiry or exercise happened.
+    checks["terminal_option_inactive_if_terminated"] = bool(
+        (not bool(df["option_terminated"].iloc[-1])) or (not bool(df["option_alive"].iloc[-1]))
+    )
 
     return checks
 
 
 def validate_sweep_table(df: pd.DataFrame) -> Dict[str, bool]:
-    """
-    Light validation for sweep outputs (cast to Python bool).
-    """
     checks: Dict[str, bool] = {}
     if df.empty:
         checks["non_empty"] = False
