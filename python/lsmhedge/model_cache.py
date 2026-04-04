@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 import importlib
-import copy
 
 
 def _cpp():
-    # Prefer package-local extension
     try:
         return importlib.import_module("lsmhedge.lsm_cpp")
     except Exception:
@@ -43,7 +41,6 @@ class LSMModelManager:
 
     def _make_cfg(self, steps: int):
         cfg = self._m.LSMConfig()
-        # Apply defaults from engine_cfg
         for k, v in self.engine_cfg.items():
             if hasattr(cfg, k):
                 if k == "basis" and isinstance(v, str):
@@ -74,7 +71,6 @@ class LSMModelManager:
                 return True
             return False
 
-        # unknown policy -> rebuild
         return True
 
     def quote(
@@ -90,7 +86,12 @@ class LSMModelManager:
         eps_rel: float = 1e-4,
     ):
         """
-        Returns: (price, delta, price_stderr, delta_stderr, rebuilt, start_step)
+        Returns:
+            (
+                price, delta, price_stderr, delta_stderr,
+                intrinsic_value, continuation_value, exercise_now,
+                rebuilt, start_step
+            )
         """
         remaining_days = int(max(1, remaining_days))
         T = float(remaining_days / self.trading_days)
@@ -115,4 +116,14 @@ class LSMModelManager:
             rebuilt = False
 
         res = self.model.quote(float(S), int(start_step), float(eps_rel))
-        return float(res.price), float(res.delta), float(res.price_stderr), float(res.delta_stderr), rebuilt, start_step
+        return (
+            float(res.price),
+            float(res.delta),
+            float(res.price_stderr),
+            float(res.delta_stderr),
+            float(res.intrinsic_value),
+            float(res.continuation_value),
+            bool(res.exercise_now),
+            rebuilt,
+            start_step,
+        )
