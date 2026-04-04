@@ -12,6 +12,11 @@ namespace lsm {
 namespace {
 
 inline double put_payoff(double S, double K) { return std::max(K - S, 0.0); }
+
+inline double put_delta_from_intrinsic(double S, double K) {
+    return (S < K ? -1.0 : 0.0);
+}
+
 inline double norm_cdf(double x) { return 0.5 * std::erfc(-x / std::sqrt(2.0)); }
 
 double black_scholes_put(double S, double K, double r, double q, double sigma, double T) {
@@ -36,7 +41,7 @@ inline void fill_monomial(Eigen::RowVectorXd& row, double x, int deg) {
 }
 
 // Laguerre L0..Ldeg with recurrence:
-// L0=1, L1=1-x, (n+1)L_{n+1} = (2n+1-x)L_n - nL_{n-1}
+// L0 = 1, L1 = 1 - x, (n+1)L_{n+1} = (2n+1-x)L_n - nL_{n-1}
 inline void fill_laguerre(Eigen::RowVectorXd& row, double x, int deg) {
     row(0) = 1.0;
     if (deg == 0) return;
@@ -58,7 +63,6 @@ inline void fill_basis(Eigen::RowVectorXd& row, double x, int deg, BasisType bt)
     else fill_laguerre(row, x, deg);
 }
 
-// Ridge via augmented QR
 Eigen::VectorXd ridge_qr(const Eigen::MatrixXd& A, const Eigen::VectorXd& y, double lambda) {
     if (lambda <= 0.0) return A.colPivHouseholderQr().solve(y);
 
@@ -151,6 +155,12 @@ struct LSMModel::Impl {
         std::vector<char> has_beta;
     };
 
+    struct CVAdjustmentResult {
+        std::vector<double> adjusted;
+        double mean = 0.0;
+        double stderr = 0.0;
+    };
+
     double K = 0.0, r = 0.0, q = 0.0, sigma = 0.0, T = 0.0;
     LSMConfig cfg{};
     int steps = 0;
@@ -161,8 +171,8 @@ struct LSMModel::Impl {
 
     std::vector<double> disc_step; // exp(-r*dt*k)
 
-    Eigen::MatrixXd S_train; // (n_train x steps+1), simulated with S0=K
-    Eigen::MatrixXd S_test;  // (n_test x steps+1), simulated with S0=K
+    Eigen::MatrixXd S_train; // (n_train x steps+1), simulated with S0 = K
+    Eigen::MatrixXd S_test;  // (n_test x steps+1), simulated with S0 = K
 
     Policy pol;
 
@@ -174,7 +184,6 @@ struct LSMModel::Impl {
         st.cf.assign(paths, 0.0);
         st.tau.assign(paths, steps);
 
-        // terminal payoff
         for (int p = 0; p < paths; ++p) {
             st.cf[p] = put_payoff(S_tr(p, steps), K);
             st.tau[p] = steps;
@@ -213,7 +222,6 @@ struct LSMModel::Impl {
             out.beta[n] = beta;
             out.has_beta[n] = 1;
 
-            // update exercise decisions on training set
             for (int row = 0; row < m; ++row) {
                 const int p = itm[row];
                 const double Sn = S_tr(p, n);
@@ -233,9 +241,7 @@ struct LSMModel::Impl {
         return out;
     }
 
-    // Apply stored policy to test paths, quoting at start_step for observed spot S0:
-    // S_m = S0 * (S_test(p,m) / S_test(p,start_step))
-    std::vector<double> apply_policy_test(double S0, int start_step) const {
+    std::vector<double> apply_policy_test(double S0, int start_step, bool allow_start_exercise) const {
         const int deg = cfg.basis_degree;
         const int paths = n_test;
 
@@ -249,7 +255,6 @@ struct LSMModel::Impl {
             inv_base[p] = 1.0 / base;
         }
 
-        // terminal payoff at maturity, discounted back to start_step later
         for (int p = 0; p < paths; ++p) {
             const double ST = S0 * S_test(p, steps) * inv_base[p];
             st.cf[p] = put_payoff(ST, K);
@@ -259,8 +264,9 @@ struct LSMModel::Impl {
         const int n0 = std::max(1, start_step);
         for (int n = steps - 1; n >= n0; --n) {
             if (!pol.has_beta[n]) continue;
-            const Eigen::VectorXd& beta = pol.beta[n];
+            if (!allow_start_exercise && n == start_step) continue;
 
+            const Eigen::VectorXd& beta = pol.beta[n];
             for (int p = 0; p < paths; ++p) {
                 const double Sn = S0 * S_test(p, n) * inv_base[p];
                 const double exercise = put_payoff(Sn, K);
@@ -285,6 +291,67 @@ struct LSMModel::Impl {
         return X;
     }
 
+    CVAdjustmentResult maybe_apply_control_variate(
+        const std::vector<double>& X,
+        double S0,
+        int start_step
+    ) const {
+        CVAdjustmentResult out;
+        out.adjusted = X;
+        out.mean = mean_of(out.adjusted);
+
+        if (!cfg.use_control_variate) {
+            out.stderr = stderr_of(out.adjusted, out.mean);
+            return out;
+        }
+
+        const double T_rem = (steps - start_step) * dt;
+        const double bs = black_scholes_put(S0, K, r, q, sigma, T_rem);
+        const double discT = std::exp(-r * T_rem);
+
+        std::vector<double> Y(n_test, 0.0);
+        for (int p = 0; p < n_test; ++p) {
+            const double base = S_test(p, start_step);
+            const double inv = 1.0 / base;
+            const double ST = S0 * S_test(p, steps) * inv;
+            Y[p] = discT * put_payoff(ST, K);
+        }
+
+        const double mx = mean_of(X);
+        const double my = mean_of(Y);
+
+        double cov = 0.0, vary = 0.0;
+        for (int p = 0; p < n_test; ++p) {
+            cov  += (X[p] - mx) * (Y[p] - my);
+            vary += (Y[p] - my) * (Y[p] - my);
+        }
+        cov /= static_cast<double>(std::max(n_test - 1, 1));
+        vary /= static_cast<double>(std::max(n_test - 1, 1));
+
+        if (vary > 0.0) {
+            const double beta_cv = cov / vary;
+            for (int p = 0; p < n_test; ++p) {
+                out.adjusted[p] = X[p] - beta_cv * (Y[p] - bs);
+            }
+            out.mean = mean_of(out.adjusted);
+        }
+
+        out.stderr = stderr_of(out.adjusted, out.mean);
+        return out;
+    }
+
+    double continuation_from_beta(double S0, int start_step, bool& has_continuation) const {
+        has_continuation = false;
+        if (start_step <= 0 || start_step >= steps) return 0.0;
+        if (!pol.has_beta[start_step]) return 0.0;
+
+        const int deg = cfg.basis_degree;
+        Eigen::RowVectorXd b(deg + 1);
+        fill_basis(b, S0 / K, deg, cfg.basis);
+        has_continuation = true;
+        return (b * pol.beta[start_step])(0);
+    }
+
     LSMPriceDeltaResult quote(double S0, int start_step, double eps_rel) const {
         if (!(S0 > 0.0)) throw std::invalid_argument("S0 must be > 0");
         if (start_step < 0 || start_step > steps) throw std::invalid_argument("start_step out of range");
@@ -292,81 +359,66 @@ struct LSMModel::Impl {
         if (eps_rel < 1e-6) throw std::invalid_argument("eps_rel too small (< 1e-6)");
         if (eps_rel > 1e-2) throw std::invalid_argument("eps_rel too large (> 1e-2)");
 
-        // expiry
+        const double intrinsic = put_payoff(S0, K);
+
         if (start_step == steps) {
-            const double payoff = put_payoff(S0, K);
             LSMPriceDeltaResult out;
-            out.price = payoff;
-            out.delta = (S0 < K ? -1.0 : 0.0);
+            out.price = intrinsic;
+            out.delta = put_delta_from_intrinsic(S0, K);
+            out.price_stderr = 0.0;
+            out.delta_stderr = 0.0;
+            out.intrinsic_value = intrinsic;
+            out.continuation_value = 0.0;
+            out.exercise_now = (intrinsic > 0.0);
+            return out;
+        }
+
+        double continuation = 0.0;
+        bool has_beta_continuation = false;
+        continuation = continuation_from_beta(S0, start_step, has_beta_continuation);
+
+        if (!has_beta_continuation) {
+            std::vector<double> X_cont = apply_policy_test(S0, start_step, false);
+            CVAdjustmentResult cv_cont = maybe_apply_control_variate(X_cont, S0, start_step);
+            continuation = cv_cont.mean;
+        }
+
+        const bool exercise_now = intrinsic > continuation;
+
+        LSMPriceDeltaResult out;
+        out.intrinsic_value = intrinsic;
+        out.continuation_value = continuation;
+        out.exercise_now = exercise_now;
+
+        if (exercise_now) {
+            out.price = intrinsic;
+            out.delta = put_delta_from_intrinsic(S0, K);
             out.price_stderr = 0.0;
             out.delta_stderr = 0.0;
             return out;
         }
+
+        std::vector<double> X0 = apply_policy_test(S0, start_step, true);
+        CVAdjustmentResult cv0 = maybe_apply_control_variate(X0, S0, start_step);
+
+        out.price = cv0.mean;
+        out.price_stderr = cv0.stderr;
 
         const double eps = eps_rel * S0;
         const double Sup = S0 + eps;
         const double Sdn = S0 - eps;
         if (Sdn <= 0.0) throw std::invalid_argument("epsilon too large: S0 - eps must be > 0");
 
-        std::vector<double> X0 = apply_policy_test(S0, start_step);
-
-        // Optional control variate at this start_step
-        std::vector<double> X0_used = X0;
-        double price0 = mean_of(X0);
-
-        if (cfg.use_control_variate) {
-            const double T_rem = (steps - start_step) * dt;
-            const double bs = black_scholes_put(S0, K, r, q, sigma, T_rem);
-            const double discT = std::exp(-r * T_rem);
-
-            // maturity payoff discounted to start_step
-            std::vector<double> Y(n_test, 0.0);
-            for (int p = 0; p < n_test; ++p) {
-                const double base = S_test(p, start_step);
-                const double inv = 1.0 / base;
-                const double ST = S0 * S_test(p, steps) * inv;
-                Y[p] = discT * put_payoff(ST, K);
-            }
-
-            const double mx = mean_of(X0);
-            const double my = mean_of(Y);
-
-            double cov = 0.0, vary = 0.0;
-            for (int p = 0; p < n_test; ++p) {
-                cov  += (X0[p] - mx) * (Y[p] - my);
-                vary += (Y[p] - my) * (Y[p] - my);
-            }
-            cov /= static_cast<double>(std::max(n_test - 1, 1));
-            vary /= static_cast<double>(std::max(n_test - 1, 1));
-
-            if (vary > 0.0) {
-                const double beta_cv = cov / vary;
-                for (int p = 0; p < n_test; ++p) {
-                    X0_used[p] = X0[p] - beta_cv * (Y[p] - bs);
-                }
-                price0 = mean_of(X0_used);
-            }
-        }
-
-        const double price_se = stderr_of(X0_used, price0);
-
-        // Delta via CRN bumps (policy re-applied on same test paths)
-        std::vector<double> Xup = apply_policy_test(Sup, start_step);
-        std::vector<double> Xdn = apply_policy_test(Sdn, start_step);
+        std::vector<double> Xup = apply_policy_test(Sup, start_step, true);
+        std::vector<double> Xdn = apply_policy_test(Sdn, start_step, true);
 
         std::vector<double> di(n_test, 0.0);
         for (int p = 0; p < n_test; ++p) {
             di[p] = (Xup[p] - Xdn[p]) / (2.0 * eps);
         }
 
-        const double delta = mean_of(di);
-        const double delta_se = stderr_of(di, delta);
-
-        LSMPriceDeltaResult out;
-        out.price = price0;
-        out.delta = delta;
-        out.price_stderr = price_se;
-        out.delta_stderr = delta_se;
+        out.delta = mean_of(di);
+        out.delta_stderr = stderr_of(di, out.delta);
         return out;
     }
 };
@@ -398,7 +450,7 @@ LSMModel::LSMModel(double K, double r, double q, double sigma, double T, const L
         impl_->disc_step[k] = std::exp(-r * impl_->dt * static_cast<double>(k));
     }
 
-    // simulate with S0 = K to keep basis x = S/K around 1 at start
+    // Simulate with S0 = K to keep basis x = S / K around 1 at build time.
     impl_->S_train = simulate_gbm(impl_->n_train, impl_->steps, K, r, q, sigma, T, cfg.seed, cfg.antithetic);
     impl_->S_test  = simulate_gbm(impl_->n_test,  impl_->steps, K, r, q, sigma, T, cfg.seed + 1, cfg.antithetic);
 
