@@ -25,10 +25,9 @@ public:
     LSMModel(LSMModel&&) noexcept;
     LSMModel& operator=(LSMModel&&) noexcept;
 
-    // Quote value/delta at time index start_step (0 = model start)
+    // Quote value/delta and current-step exercise diagnostics at time index start_step.
     LSMPriceDeltaResult quote(double S0, int start_step = 0, double eps_rel = 1e-4) const;
 
-    // Accessors
     int steps() const;
     double dt() const;
     double K() const;
