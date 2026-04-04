@@ -1,8 +1,5 @@
 #include <pybind11/pybind11.h>
 #include <stdexcept>
-#include <cstdio>
-#include <string>
-#include <memory>
 
 #include "src/cpp/lsm/lsm_model.h"
 #include "src/cpp/lsm/lsm_model_object.h"
@@ -49,9 +46,11 @@ PYBIND11_MODULE(lsm_cpp, m) {
         .def_readwrite("price", &lsm::LSMPriceDeltaResult::price)
         .def_readwrite("delta", &lsm::LSMPriceDeltaResult::delta)
         .def_readwrite("price_stderr", &lsm::LSMPriceDeltaResult::price_stderr)
-        .def_readwrite("delta_stderr", &lsm::LSMPriceDeltaResult::delta_stderr);
+        .def_readwrite("delta_stderr", &lsm::LSMPriceDeltaResult::delta_stderr)
+        .def_readwrite("intrinsic_value", &lsm::LSMPriceDeltaResult::intrinsic_value)
+        .def_readwrite("continuation_value", &lsm::LSMPriceDeltaResult::continuation_value)
+        .def_readwrite("exercise_now", &lsm::LSMPriceDeltaResult::exercise_now);
 
-    // Stateless APIs (existing)
     m.def(
         "price_bermudan_put_lsm",
         [](double S0, double K, double r, double q, double sigma, double T, const lsm::LSMConfig& cfg) {
@@ -74,7 +73,6 @@ PYBIND11_MODULE(lsm_cpp, m) {
         py::arg("cfg")
     );
 
-    // Stateful desk-style model
     py::class_<lsm::LSMModel, std::shared_ptr<lsm::LSMModel>>(m, "LSMModel")
         .def(py::init<double,double,double,double,double,const lsm::LSMConfig&>(),
              py::arg("K"), py::arg("r"), py::arg("q"), py::arg("sigma"), py::arg("T"), py::arg("cfg"))
