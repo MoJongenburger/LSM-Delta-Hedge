@@ -4,7 +4,6 @@ from typing import Any, Tuple
 import warnings
 import importlib
 
-# We keep a module-level cache of the loaded extension module.
 _lsm_cpp = None
 
 
@@ -13,8 +12,8 @@ def _load_cpp():
     Load the compiled extension in a deterministic way.
 
     Priority:
-      1) package-local extension: lsmhedge.lsm_cpp  (this is what CI copies in)
-      2) top-level module: lsm_cpp                 (if user put build/ on PYTHONPATH)
+      1) package-local extension: lsmhedge.lsm_cpp
+      2) top-level module: lsm_cpp
     """
     global _lsm_cpp
     if _lsm_cpp is not None:
@@ -22,14 +21,12 @@ def _load_cpp():
 
     errors = []
 
-    # 1) Force package-local import (this avoids stub/import edge cases)
     try:
         _lsm_cpp = importlib.import_module("lsmhedge.lsm_cpp")
         return _lsm_cpp
     except Exception as e:
         errors.append(("lsmhedge.lsm_cpp", repr(e)))
 
-    # 2) Fallback: top-level module import
     try:
         _lsm_cpp = importlib.import_module("lsm_cpp")
         return _lsm_cpp
@@ -95,6 +92,32 @@ def price_and_delta_bermudan_put(
     eps_rel: float = 1e-4,
     **cfg_kwargs: Any
 ) -> Tuple[float, float, float, float]:
+    """
+    Backward-compatible public wrapper: returns only price/delta/stderrs.
+    """
+    out = price_delta_exercise_bermudan_put(
+        S0=S0, K=K, r=r, q=q, sigma=sigma, T=T, eps_rel=eps_rel, **cfg_kwargs
+    )
+    return out[0], out[1], out[2], out[3]
+
+
+def price_delta_exercise_bermudan_put(
+    S0: float,
+    K: float,
+    r: float,
+    q: float,
+    sigma: float,
+    T: float,
+    eps_rel: float = 1e-4,
+    **cfg_kwargs: Any
+) -> Tuple[float, float, float, float, float, float, bool]:
+    """
+    Rich wrapper used by the hedge engine.
+
+    Returns:
+        price, delta, price_stderr, delta_stderr,
+        intrinsic_value, continuation_value, exercise_now
+    """
     lsm_cpp = _load_cpp()
 
     if S0 <= 0 or K <= 0:
@@ -110,4 +133,12 @@ def price_and_delta_bermudan_put(
     res = lsm_cpp.price_and_delta_bermudan_put_lsm(
         float(S0), float(K), float(r), float(q), float(sigma), float(T), float(eps_rel), cfg
     )
-    return float(res.price), float(res.delta), float(res.price_stderr), float(res.delta_stderr)
+    return (
+        float(res.price),
+        float(res.delta),
+        float(res.price_stderr),
+        float(res.delta_stderr),
+        float(res.intrinsic_value),
+        float(res.continuation_value),
+        bool(res.exercise_now),
+    )
