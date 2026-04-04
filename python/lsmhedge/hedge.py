@@ -7,7 +7,7 @@ from collections import OrderedDict
 import numpy as np
 import pandas as pd
 
-from . import price_and_delta_bermudan_put
+from . import price_delta_exercise_bermudan_put
 from .metrics import summarize_hedge, as_dict
 from .model_cache import LSMModelManager, RecalibrationConfig
 
@@ -28,7 +28,12 @@ class HedgeConfig:
     # costs
     tc_bps: float = 0.0
 
-    # early exercise heuristic
+    # exercise handling
+    exercise_policy: str = "model"       # "model" | "heuristic" | "none"
+    settlement_style: str = "physical_put"  # "physical_put" | "cash"
+    flatten_after_termination: bool = True
+
+    # legacy heuristic (optional)
     exercise_detection: bool = True
     exercise_k_stderr: float = 2.0
     exercise_delta_gate: float = -0.95
@@ -68,7 +73,7 @@ class HedgeConfig:
 class LRUQuoteCache:
     def __init__(self, maxsize: int = 512):
         self.maxsize = int(maxsize)
-        self._d: "OrderedDict[Tuple[float, float, float, float, float], Tuple[float, float, float, float]]" = OrderedDict()
+        self._d: "OrderedDict[Tuple[float, float, float, float, float], Tuple[float, float, float, float, float, float, bool]]" = OrderedDict()
 
     def get(self, key):
         if key not in self._d:
@@ -100,6 +105,33 @@ def _cache_key(S: float, sigma: float, r: float, q: float, T: float, cfg: HedgeC
     )
 
 
+def _should_terminate_early(
+    cfg: HedgeConfig,
+    *,
+    payoff: float,
+    option_price: float,
+    delta: float,
+    price_se: float,
+    model_exercise_now: bool,
+) -> bool:
+    policy = str(cfg.exercise_policy).lower()
+
+    if policy == "none":
+        return False
+    if policy == "model":
+        return bool(model_exercise_now)
+    if policy == "heuristic":
+        if not cfg.exercise_detection or payoff <= 0.0:
+            return False
+        time_value = float(option_price - payoff)
+        return (
+            time_value <= float(cfg.exercise_k_stderr) * float(max(price_se, 0.0))
+            and float(delta) <= float(cfg.exercise_delta_gate)
+        )
+
+    raise ValueError("exercise_policy must be one of: 'model', 'heuristic', 'none'")
+
+
 def run_single_trade_delta_hedge(
     market: pd.DataFrame,
     cfg: HedgeConfig,
@@ -123,7 +155,7 @@ def run_single_trade_delta_hedge(
     if expiry_idx <= start_idx:
         raise ValueError("Not enough data for hedge horizon.")
 
-    path = df.iloc[start_idx : expiry_idx + 1].copy()
+    path = df.iloc[start_idx: expiry_idx + 1].copy()
     dates = path.index
     n = len(path)
 
@@ -141,7 +173,7 @@ def run_single_trade_delta_hedge(
     stock = np.float64(0.0)
     option_alive = True
 
-    premium0 = np.nan  # store premium received at t=0 for reporting/metrics
+    premium0 = np.nan
 
     manager = None
     if cfg.use_stateful_model:
@@ -180,17 +212,36 @@ def run_single_trade_delta_hedge(
         delta = 0.0
         price_se = 0.0
         delta_se = 0.0
+        model_intrinsic = payoff
+        model_continuation = 0.0
+        model_exercise_now = False
         exercised_now = False
+        assigned_physical = False
+        assignment_shares = 0.0
         rebuilt_model = False
         model_age = None
+        option_terminated = False
 
         if option_alive:
             if remaining_days <= 0:
                 option_price = payoff
                 delta = -1.0 if S < K else 0.0
+                model_intrinsic = payoff
+                model_continuation = 0.0
+                model_exercise_now = bool(payoff > 0.0)
             else:
                 if cfg.use_stateful_model and manager is not None:
-                    option_price, delta, price_se, delta_se, rebuilt_model, model_age = manager.quote(
+                    (
+                        option_price,
+                        delta,
+                        price_se,
+                        delta_se,
+                        model_intrinsic,
+                        model_continuation,
+                        model_exercise_now,
+                        rebuilt_model,
+                        model_age,
+                    ) = manager.quote(
                         day_idx=i,
                         remaining_days=remaining_days,
                         S=S,
@@ -205,48 +256,89 @@ def run_single_trade_delta_hedge(
                         key = _cache_key(S, sigma, r, q, T_rem, cfg)
                         hit = cache.get(key)
                         if hit is not None:
-                            option_price, delta, price_se, delta_se = hit
+                            (
+                                option_price,
+                                delta,
+                                price_se,
+                                delta_se,
+                                model_intrinsic,
+                                model_continuation,
+                                model_exercise_now,
+                            ) = hit
                         else:
-                            option_price, delta, price_se, delta_se = price_and_delta_bermudan_put(
+                            quote = price_delta_exercise_bermudan_put(
                                 S0=S, K=K, r=r, q=q, sigma=sigma, T=T_rem, eps_rel=cfg.eps_rel, **cfg.engine_cfg
                             )
-                            cache.put(key, (option_price, delta, price_se, delta_se))
+                            cache.put(key, quote)
+                            (
+                                option_price,
+                                delta,
+                                price_se,
+                                delta_se,
+                                model_intrinsic,
+                                model_continuation,
+                                model_exercise_now,
+                            ) = quote
                     else:
-                        option_price, delta, price_se, delta_se = price_and_delta_bermudan_put(
+                        (
+                            option_price,
+                            delta,
+                            price_se,
+                            delta_se,
+                            model_intrinsic,
+                            model_continuation,
+                            model_exercise_now,
+                        ) = price_delta_exercise_bermudan_put(
                             S0=S, K=K, r=r, q=q, sigma=sigma, T=T_rem, eps_rel=cfg.eps_rel, **cfg.engine_cfg
                         )
-
-            if cfg.exercise_detection and payoff > 0.0 and remaining_days > 0:
-                time_value = float(option_price - payoff)
-                if (time_value <= float(cfg.exercise_k_stderr) * float(max(price_se, 0.0))) and (float(delta) <= float(cfg.exercise_delta_gate)):
-                    exercised_now = True
 
             if i == 0:
                 premium0 = float(option_price)
                 cash = np.float64(float(cash) + float(option_price))
 
-            target_stock = np.float64(float(delta))
-            trade = float(target_stock - stock)
-            tcost = _tc_cost(trade, S, cfg.tc_bps)
-            cash = np.float64(float(cash) - trade * S - tcost)
-            stock = target_stock
+            terminate_for_expiry = bool(remaining_days <= 0)
+            terminate_early = _should_terminate_early(
+                cfg,
+                payoff=payoff,
+                option_price=option_price,
+                delta=delta,
+                price_se=price_se,
+                model_exercise_now=model_exercise_now,
+            )
+            option_terminated = bool(terminate_for_expiry or terminate_early)
 
-            if exercised_now:
-                cash = np.float64(float(cash) - payoff)
+            if option_terminated:
+                exercised_now = bool(payoff > 0.0 and (terminate_for_expiry or terminate_early))
 
-                trade2 = float(-stock)
-                tcost2 = _tc_cost(trade2, S, cfg.tc_bps)
-                cash = np.float64(float(cash) - trade2 * S - tcost2)
+                if exercised_now:
+                    if cfg.settlement_style == "physical_put":
+                        cash = np.float64(float(cash) - float(K))
+                        stock = np.float64(float(stock) + 1.0)
+                        assigned_physical = True
+                        assignment_shares = 1.0
+                    elif cfg.settlement_style == "cash":
+                        cash = np.float64(float(cash) - float(payoff))
+                    else:
+                        raise ValueError("settlement_style must be 'physical_put' or 'cash'")
 
-                trade += trade2
-                tcost += tcost2
-
-                stock = np.float64(0.0)
                 option_alive = False
                 option_price = 0.0
                 delta = 0.0
                 price_se = 0.0
                 delta_se = 0.0
+
+                if cfg.flatten_after_termination:
+                    target_stock = np.float64(0.0)
+                    trade = float(target_stock - stock)
+                    tcost = _tc_cost(trade, S, cfg.tc_bps)
+                    cash = np.float64(float(cash) - trade * S - tcost)
+                    stock = target_stock
+            else:
+                target_stock = np.float64(float(delta))
+                trade = float(target_stock - stock)
+                tcost = _tc_cost(trade, S, cfg.tc_bps)
+                cash = np.float64(float(cash) - trade * S - tcost)
+                stock = target_stock
 
         book_value = float(cash + stock * np.float64(S) - np.float64(option_price))
 
@@ -264,11 +356,17 @@ def run_single_trade_delta_hedge(
                 "delta": delta,
                 "price_stderr": price_se,
                 "delta_stderr": delta_se,
+                "model_intrinsic": float(model_intrinsic),
+                "model_continuation": float(model_continuation),
+                "model_exercise_now": bool(model_exercise_now),
                 "cash": float(cash),
                 "stock": float(stock),
                 "trade": float(trade),
                 "tcost": float(tcost),
                 "exercised_now": bool(exercised_now),
+                "assigned_physical": bool(assigned_physical),
+                "assignment_shares": float(assignment_shares),
+                "option_terminated": bool(option_terminated),
                 "option_alive": bool(option_alive),
                 "book_value": float(book_value),
                 "model_rebuilt": bool(rebuilt_model),
@@ -285,4 +383,7 @@ def run_single_trade_delta_hedge(
     out["pnl_change"] = out["pnl"].diff().fillna(0.0)
 
     rep = summarize_hedge(out, value_col="book_value")
-    return out, as_dict(rep)
+    report = as_dict(rep)
+    report["exercised_early"] = float(bool("exercised_now" in out.columns and out["exercised_now"].iloc[:-1].astype(bool).any()))
+    report["assigned_physical"] = float(bool("assigned_physical" in out.columns and out["assigned_physical"].astype(bool).any()))
+    return out, report
