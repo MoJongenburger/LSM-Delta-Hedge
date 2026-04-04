@@ -6,13 +6,16 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace lsm {
 namespace {
 
 inline double put_payoff(double S, double K) { return std::max(K - S, 0.0); }
+
+inline double put_delta_from_intrinsic(double S, double K) {
+    return (S < K ? -1.0 : 0.0);
+}
 
 inline double norm_cdf(double x) { return 0.5 * std::erfc(-x / std::sqrt(2.0)); }
 
@@ -38,7 +41,7 @@ inline void fill_monomial(Eigen::RowVectorXd& row, double x, int deg) {
 }
 
 // Laguerre L0..Ldeg with recurrence:
-// L0=1, L1=1-x, (n+1)L_{n+1} = (2n+1-x)L_n - nL_{n-1}
+// L0 = 1, L1 = 1 - x, (n+1)L_{n+1} = (2n+1-x)L_n - nL_{n-1}
 inline void fill_laguerre(Eigen::RowVectorXd& row, double x, int deg) {
     row(0) = 1.0;
     if (deg == 0) return;
@@ -79,7 +82,6 @@ Eigen::VectorXd ridge_qr(const Eigen::MatrixXd& A, const Eigen::VectorXd& y, dou
     return Aaug.colPivHouseholderQr().solve(yaug);
 }
 
-// Simulate GBM paths into Eigen matrix (paths x (steps+1))
 Eigen::MatrixXd simulate_gbm(
     int paths,
     int steps,
@@ -145,16 +147,13 @@ inline void init_terminal_scaled(const Eigen::MatrixXd& S_base, double scale, in
 
 struct Policy {
     std::vector<Eigen::VectorXd> beta; // beta[n] is regression coeff at time n (size deg+1)
-    std::vector<char> has_beta;        // has_beta[n]=1 if beta[n] valid
+    std::vector<char> has_beta;        // has_beta[n] = 1 if beta[n] valid
 };
 
-// Train LSM continuation regressions on training paths (and update train exercise decisions).
 Policy train_policy_lsm(
     const Eigen::MatrixXd& S_train,
     double K,
     int steps,
-    double r,
-    double dt,
     const std::vector<double>& disc_step,
     int deg,
     BasisType basis,
@@ -185,10 +184,9 @@ Policy train_policy_lsm(
         for (int row = 0; row < m; ++row) {
             const int p = itm[row];
             const double Sn = S_train(p, n);
-            const double x = Sn / K;
 
             Eigen::RowVectorXd b(deg + 1);
-            fill_basis(b, x, deg, basis);
+            fill_basis(b, Sn / K, deg, basis);
             A.row(row) = b;
 
             const int tau_p = tr.tau[p];
@@ -200,7 +198,6 @@ Policy train_policy_lsm(
         pol.beta[n] = beta;
         pol.has_beta[n] = 1;
 
-        // Update train exercise decisions using the trained beta
         for (int row = 0; row < m; ++row) {
             const int p = itm[row];
             const double Sn = S_train(p, n);
@@ -220,17 +217,16 @@ Policy train_policy_lsm(
     return pol;
 }
 
-// Apply a trained policy to scaled test paths (no bumped matrix allocation).
 std::vector<double> apply_policy_to_test_scaled(
     const Eigen::MatrixXd& S_test_base,
     double scale,
     const Policy& pol,
     double K,
     int steps,
-    double dt,
     const std::vector<double>& disc_step,
     int deg,
-    BasisType basis
+    BasisType basis,
+    bool /*allow_start_exercise*/
 ) {
     const int n_test = static_cast<int>(S_test_base.rows());
 
@@ -239,8 +235,8 @@ std::vector<double> apply_policy_to_test_scaled(
 
     for (int n = steps - 1; n >= 1; --n) {
         if (!pol.has_beta[n]) continue;
-        const Eigen::VectorXd& beta = pol.beta[n];
 
+        const Eigen::VectorXd& beta = pol.beta[n];
         for (int p = 0; p < n_test; ++p) {
             const double Sn = scale * S_test_base(p, n);
             const double exercise = put_payoff(Sn, K);
@@ -279,11 +275,67 @@ inline double stderr_of(const std::vector<double>& v, double mean) {
     return std::sqrt(var / static_cast<double>(n));
 }
 
+struct CVAdjustmentResult {
+    std::vector<double> adjusted;
+    double mean = 0.0;
+    double stderr = 0.0;
+};
+
+CVAdjustmentResult maybe_apply_control_variate(
+    const std::vector<double>& X,
+    const Eigen::MatrixXd& S_test,
+    double S0,
+    double K,
+    double r,
+    double q,
+    double sigma,
+    double T,
+    bool use_control_variate
+) {
+    CVAdjustmentResult out;
+    out.adjusted = X;
+    out.mean = mean_of(out.adjusted);
+
+    if (!use_control_variate) {
+        out.stderr = stderr_of(out.adjusted, out.mean);
+        return out;
+    }
+
+    const int n_test = static_cast<int>(S_test.rows());
+    const double bs = black_scholes_put(S0, K, r, q, sigma, T);
+    const double discT = std::exp(-r * T);
+
+    std::vector<double> Y(n_test, 0.0);
+    for (int p = 0; p < n_test; ++p) {
+        Y[p] = discT * put_payoff(S_test(p, S_test.cols() - 1), K);
+    }
+
+    const double mx = mean_of(X);
+    const double my = mean_of(Y);
+
+    double cov = 0.0;
+    double vary = 0.0;
+    for (int p = 0; p < n_test; ++p) {
+        cov  += (X[p] - mx) * (Y[p] - my);
+        vary += (Y[p] - my) * (Y[p] - my);
+    }
+    cov /= static_cast<double>(std::max(n_test - 1, 1));
+    vary /= static_cast<double>(std::max(n_test - 1, 1));
+
+    if (vary > 0.0) {
+        const double beta_cv = cov / vary;
+        for (int p = 0; p < n_test; ++p) {
+            out.adjusted[p] = X[p] - beta_cv * (Y[p] - bs);
+        }
+        out.mean = mean_of(out.adjusted);
+    }
+
+    out.stderr = stderr_of(out.adjusted, out.mean);
+    return out;
+}
+
 } // namespace
 
-// --------------------
-// Step 1: price-only
-// --------------------
 LSMPriceResult price_bermudan_put_lsm(
     double S0,
     double K,
@@ -315,56 +367,19 @@ LSMPriceResult price_bermudan_put_lsm(
     Eigen::MatrixXd S_train = simulate_gbm(n_train, steps, S0, r, q, sigma, T, cfg.seed, cfg.antithetic);
     Eigen::MatrixXd S_test  = simulate_gbm(n_test,  steps, S0, r, q, sigma, T, cfg.seed + 1, cfg.antithetic);
 
-    Policy pol = train_policy_lsm(S_train, K, steps, r, dt, disc_step, deg, cfg.basis, cfg.ridge);
+    Policy pol = train_policy_lsm(S_train, K, steps, disc_step, deg, cfg.basis, cfg.ridge);
+    std::vector<double> X = apply_policy_to_test_scaled(
+        S_test, 1.0, pol, K, steps, disc_step, deg, cfg.basis, true
+    );
 
-    std::vector<double> X = apply_policy_to_test_scaled(S_test, 1.0, pol, K, steps, dt, disc_step, deg, cfg.basis);
-
-    double price = mean_of(X);
-
-    // Optional control variate: European put payoff at maturity
-    if (cfg.use_control_variate) {
-        const double bs = black_scholes_put(S0, K, r, q, sigma, T);
-        const double discT = std::exp(-r * T);
-
-        std::vector<double> Y(n_test, 0.0);
-        for (int p = 0; p < n_test; ++p) {
-            Y[p] = discT * put_payoff(S_test(p, steps), K);
-        }
-
-        const double mx = mean_of(X);
-        const double my = mean_of(Y);
-
-        double cov = 0.0, vary = 0.0;
-        for (int p = 0; p < n_test; ++p) {
-            cov  += (X[p] - mx) * (Y[p] - my);
-            vary += (Y[p] - my) * (Y[p] - my);
-        }
-        cov /= static_cast<double>(std::max(n_test - 1, 1));
-        vary /= static_cast<double>(std::max(n_test - 1, 1));
-
-        if (vary > 0.0) {
-            const double beta_cv = cov / vary;
-            std::vector<double> Xadj(n_test, 0.0);
-            for (int p = 0; p < n_test; ++p) Xadj[p] = X[p] - beta_cv * (Y[p] - bs);
-
-            price = mean_of(Xadj);
-
-            LSMPriceResult res;
-            res.price = price;
-            res.mc_stderr = stderr_of(Xadj, price);
-            return res;
-        }
-    }
+    CVAdjustmentResult cv = maybe_apply_control_variate(X, S_test, S0, K, r, q, sigma, T, cfg.use_control_variate);
 
     LSMPriceResult res;
-    res.price = price;
-    res.mc_stderr = stderr_of(X, price);
+    res.price = cv.mean;
+    res.mc_stderr = cv.stderr;
     return res;
 }
 
-// --------------------
-// Step 3: price + delta (CRN, frozen regression) with lazy scaling bumps
-// --------------------
 LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     double S0,
     double K,
@@ -401,41 +416,37 @@ LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     Eigen::MatrixXd S_train = simulate_gbm(n_train, steps, S0, r, q, sigma, T, cfg.seed, cfg.antithetic);
     Eigen::MatrixXd S_test  = simulate_gbm(n_test,  steps, S0, r, q, sigma, T, cfg.seed + 1, cfg.antithetic);
 
-    Policy pol = train_policy_lsm(S_train, K, steps, r, dt, disc_step, deg, cfg.basis, cfg.ridge);
+    Policy pol = train_policy_lsm(S_train, K, steps, disc_step, deg, cfg.basis, cfg.ridge);
 
-    // Base price on test set
-    std::vector<double> X0 = apply_policy_to_test_scaled(S_test, 1.0, pol, K, steps, dt, disc_step, deg, cfg.basis);
-    double price0 = mean_of(X0);
+    const double intrinsic = put_payoff(S0, K);
 
-    // Optional control variate on base price
-    std::vector<double> X0_used = X0;
-    if (cfg.use_control_variate) {
-        const double bs = black_scholes_put(S0, K, r, q, sigma, T);
-        const double discT = std::exp(-r * T);
+    // Continuation-only estimate at the current quote time.
+    std::vector<double> X_cont = apply_policy_to_test_scaled(
+        S_test, 1.0, pol, K, steps, disc_step, deg, cfg.basis, true
+    );
+    CVAdjustmentResult cv_cont = maybe_apply_control_variate(
+        X_cont, S_test, S0, K, r, q, sigma, T, cfg.use_control_variate
+    );
 
-        std::vector<double> Y(n_test, 0.0);
-        for (int p = 0; p < n_test; ++p) Y[p] = discT * put_payoff(S_test(p, steps), K);
+    const double continuation = cv_cont.mean;
+    const bool exercise_now = intrinsic > continuation;
 
-        const double mx = mean_of(X0);
-        const double my = mean_of(Y);
+    LSMPriceDeltaResult out;
+    out.intrinsic_value = intrinsic;
+    out.continuation_value = continuation;
+    out.exercise_now = exercise_now;
 
-        double cov = 0.0, vary = 0.0;
-        for (int p = 0; p < n_test; ++p) {
-            cov  += (X0[p] - mx) * (Y[p] - my);
-            vary += (Y[p] - my) * (Y[p] - my);
-        }
-        cov /= static_cast<double>(std::max(n_test - 1, 1));
-        vary /= static_cast<double>(std::max(n_test - 1, 1));
-
-        if (vary > 0.0) {
-            const double beta_cv = cov / vary;
-            for (int p = 0; p < n_test; ++p) X0_used[p] = X0[p] - beta_cv * (Y[p] - bs);
-            price0 = mean_of(X0_used);
-        }
+    if (exercise_now || T <= 0.0) {
+        out.price = intrinsic;
+        out.delta = put_delta_from_intrinsic(S0, K);
+        out.price_stderr = 0.0;
+        out.delta_stderr = 0.0;
+        return out;
     }
-    const double price_stderr = stderr_of(X0_used, price0);
 
-    // CRN finite-difference delta with frozen regression + lazy scaling
+    out.price = continuation;
+    out.price_stderr = cv_cont.stderr;
+
     const double eps = eps_rel * S0;
     const double S_up = S0 + eps;
     const double S_dn = S0 - eps;
@@ -444,20 +455,18 @@ LSMPriceDeltaResult price_and_delta_bermudan_put_lsm(
     const double scale_up = S_up / S0;
     const double scale_dn = S_dn / S0;
 
-    std::vector<double> Xup = apply_policy_to_test_scaled(S_test, scale_up, pol, K, steps, dt, disc_step, deg, cfg.basis);
-    std::vector<double> Xdn = apply_policy_to_test_scaled(S_test, scale_dn, pol, K, steps, dt, disc_step, deg, cfg.basis);
+    std::vector<double> Xup = apply_policy_to_test_scaled(
+        S_test, scale_up, pol, K, steps, disc_step, deg, cfg.basis, true
+    );
+    std::vector<double> Xdn = apply_policy_to_test_scaled(
+        S_test, scale_dn, pol, K, steps, disc_step, deg, cfg.basis, true
+    );
 
     std::vector<double> di(n_test, 0.0);
     for (int p = 0; p < n_test; ++p) di[p] = (Xup[p] - Xdn[p]) / (2.0 * eps);
 
-    const double delta = mean_of(di);
-    const double delta_stderr = stderr_of(di, delta);
-
-    LSMPriceDeltaResult out;
-    out.price = price0;
-    out.delta = delta;
-    out.price_stderr = price_stderr;
-    out.delta_stderr = delta_stderr;
+    out.delta = mean_of(di);
+    out.delta_stderr = stderr_of(di, out.delta);
     return out;
 }
 
